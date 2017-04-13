@@ -60,6 +60,7 @@ default{T<:TimePeriod}(p::Union{T,Type{T}}) = T(0)
 
 (-){P<:Period}(x::P) = P(-value(x))
 =={P<:Period}(x::P, y::P) = value(x) == value(y)
+==(x::Period, y::Period) = (==)(promote(x, y)...)
 Base.isless{P<:Period}(x::P, y::P) = isless(value(x), value(y))
 Base.isless(x::Period, y::Period) = isless(promote(x, y)...)
 
@@ -426,8 +427,6 @@ for i = 1:length(fixedperiod_conversions)
         N *= nc
     end
 end
-# have to declare thusly so that diagonal dispatch above takes precedence:
-(==){T<:FixedPeriod, S<:FixedPeriod}(x::T, y::S) = (==)(promote(x, y)...)
 
 # other periods with fixed conversions but which aren't fixed time periods
 const OtherPeriod = Union{Month, Year}
@@ -439,7 +438,10 @@ let vmax = typemax(Int64) ÷ 12, vmin = typemin(Int64) ÷ 12
 end
 Base.convert(::Type{Year}, x::Month) = Year(divexact(value(x), 12))
 Base.promote_rule(::Type{Year}, ::Type{Month}) = Month
-(==){T<:OtherPeriod, S<:OtherPeriod}(x::T, y::S) = (==)(promote(x, y)...)
+
+# disallow comparing fixed to other periods
+(==){T<:FixedPeriod, S<:OtherPeriod}(x::T, y::S) = throw(MethodError(==, (T, S)))
+(==){T<:OtherPeriod, S<:FixedPeriod}(x::T, y::S) = throw(MethodError(==, (T, S)))
 
 Base.isless{T<:FixedPeriod,S<:OtherPeriod}(x::T, y::S) = throw(MethodError(isless, (T, S)))
 Base.isless{T<:OtherPeriod,S<:FixedPeriod}(x::T, y::S) = throw(MethodError(isless, (T, S)))

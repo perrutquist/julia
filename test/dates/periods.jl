@@ -235,6 +235,8 @@ test = ((((((((dt + y) - m) + w) - d) + h) - mi) + s) - ms)
 @test Dates.Millisecond(1) == Dates.Millisecond(1)
 @test_throws MethodError Dates.Year(1) < Dates.Millisecond(1)
 @test_throws MethodError Dates.Millisecond(1) < Dates.Year(1)
+@test_throws MethodError Dates.Year(1) == Dates.Millisecond(1)
+@test_throws MethodError Dates.Millisecond(1) == Dates.Year(1)
 
 @test Dates.Year("1") == y
 @test Dates.Month("1") == m
