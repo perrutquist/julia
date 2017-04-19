@@ -440,11 +440,11 @@ Base.convert(::Type{Year}, x::Month) = Year(divexact(value(x), 12))
 Base.promote_rule(::Type{Year}, ::Type{Month}) = Month
 
 # disallow comparing fixed to other periods
-(==){T<:FixedPeriod, S<:OtherPeriod}(x::T, y::S) = throw(MethodError(==, (T, S)))
-(==){T<:OtherPeriod, S<:FixedPeriod}(x::T, y::S) = throw(MethodError(==, (T, S)))
+(==){T<:FixedPeriod, S<:OtherPeriod}(x::T, y::S) = throw(MethodError(==, (x, y)))
+(==){T<:OtherPeriod, S<:FixedPeriod}(x::T, y::S) = throw(MethodError(==, (x, y)))
 
-Base.isless{T<:FixedPeriod,S<:OtherPeriod}(x::T, y::S) = throw(MethodError(isless, (T, S)))
-Base.isless{T<:OtherPeriod,S<:FixedPeriod}(x::T, y::S) = throw(MethodError(isless, (T, S)))
+Base.isless{T<:FixedPeriod,S<:OtherPeriod}(x::T, y::S) = throw(MethodError(isless, (x, y)))
+Base.isless{T<:OtherPeriod,S<:FixedPeriod}(x::T, y::S) = throw(MethodError(isless, (x, y)))
 
 # truncating conversions to milliseconds and days:
 toms(c::Nanosecond)  = div(value(c), 1000000)
