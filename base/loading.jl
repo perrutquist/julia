@@ -246,6 +246,11 @@ const DEBUG_LOADING = Ref(false)
 # to synchronize multiple tasks trying to import/using something
 const package_locks = Dict{Symbol,Condition}()
 
+# to notify downstream consumers that a module was successfully loaded
+# callbacks are not allowed to block. Callbacks take the form
+# (mod::String) -> nothing
+const package_callbacks = Vector{Function}()
+
 # used to optionally track dependencies when requiring a module:
 const _concrete_dependencies = Any[] # these dependency versions are "set in stone", and the process should try to avoid invalidating them
 const _require_dependencies = Any[] # a list of (path, mtime) tuples that are the file dependencies of the module currently being precompiled
@@ -408,6 +413,10 @@ function require(mod::Symbol)
         if JLOptions().use_compilecache != 0
             doneprecompile = _require_search_from_serialized(1, mod, path, last)
             if !isa(doneprecompile, Bool)
+                # After successfully loading notify downstream consumers
+                for callback in package_callbacks
+                    eval(Main, :($callback($name)))
+                end
                 return # success
             end
         end
@@ -435,6 +444,10 @@ function require(mod::Symbol)
                 warn(m, prefix="WARNING: ")
                 # fall-through, TODO: disable __precompile__(true) error so that the normal include will succeed
             else
+                # After successfully loading notify downstream consumers
+                for callback in package_callbacks
+                    eval(Main, :($callback($name)))
+                end
                 return # success
             end
         end
@@ -464,6 +477,10 @@ function require(mod::Symbol)
                 # TODO: disable __precompile__(true) error and do normal include instead of error
                 error("Module $mod declares __precompile__(true) but require failed to create a usable precompiled cache file.")
             end
+        end
+        # After successfully loading notify downstream consumers
+        for callback in package_callbacks
+            eval(Main, :($callback($name)))
         end
     finally
         toplevel_load = last
