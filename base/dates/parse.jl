@@ -281,9 +281,14 @@ function Base.tryparse{T<:TimeType}(
     pos, len = start(str), endof(str)
     values, pos = tryparsenext_internal(T, str, pos, len, df, false)
     if isnull(values)
-        Nullable{T}()
+        return Nullable{T}()
     else
-        Nullable{T}(T(unsafe_get(values)...))
+        try
+            parsed = Nullable{T}(T(unsafe_get(values)...))
+        catch
+            parsed = Nullable{T}()
+        end
+        return parsed
     end
 end
 
