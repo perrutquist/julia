@@ -74,6 +74,13 @@ typedef struct {
     int         full_sweep;
 } jl_gc_num_t;
 
+typedef struct {
+    void **pc; // Current stack address for the pc (up growing)
+    char *data; // Current stack address for the data (up growing)
+    void **pc_start; // Cached value of `gc_cache->pc_stack`
+    void **pc_end; // Cached value of `gc_cache->pc_stack_end`
+} gc_mark_sp_t;
+
 // layout for big (>2k) objects
 
 typedef struct _bigval_t {
@@ -343,9 +350,20 @@ STATIC_INLINE void gc_big_object_link(bigval_t *hdr, bigval_t **list)
     *list = hdr;
 }
 
+STATIC_INLINE void gc_mark_sp_init(jl_gc_mark_cache_t *gc_cache, gc_mark_sp_t *sp)
+{
+    sp->pc = gc_cache->pc_stack;
+    sp->data = gc_cache->data_stack;
+    sp->pc_start = gc_cache->pc_stack;
+    sp->pc_end = gc_cache->pc_stack_end;
+}
+
 void mark_all_roots(jl_ptls_t ptls);
 void gc_mark_object_list(jl_ptls_t ptls, arraylist_t *list, size_t start);
 void visit_mark_stack(jl_ptls_t ptls);
+void gc_mark_queue_finlist(jl_gc_mark_cache_t *gc_cache, gc_mark_sp_t *sp,
+                           arraylist_t *list, size_t start);
+void *const *gc_mark_loop(jl_ptls_t ptls, gc_mark_sp_t sp);
 void gc_debug_init(void);
 void jl_mark_box_caches(jl_ptls_t ptls);
 
@@ -461,10 +479,23 @@ extern int gc_verifying;
 #else
 #define gc_verify(ptls)
 #define verify_val(v)
-#define verify_parent1(ty,obj,slot,arg1)
-#define verify_parent2(ty,obj,slot,arg1,arg2)
+#define verify_parent1(ty,obj,slot,arg1) do {} while (0)
+#define verify_parent2(ty,obj,slot,arg1,arg2) do {} while (0)
 #define gc_verifying (0)
 #endif
+
+STATIC_INLINE int gc_slot_to_index(jl_value_t *obj, void *slot)
+{
+    jl_datatype_t *vt = (jl_datatype_t*)jl_typeof(obj);
+    int nf = (int)jl_datatype_nfields(vt);
+    for (int i = 0; i < nf; i++) {
+        void *fieldaddr = (char*)obj + jl_field_offset(vt, i);
+        if (fieldaddr >= slot) {
+            return i;
+        }
+    }
+    return -1;
+}
 
 #ifdef GC_DEBUG_ENV
 JL_DLLEXPORT extern jl_gc_debug_env_t jl_gc_debug_env;
