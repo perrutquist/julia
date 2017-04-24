@@ -1406,19 +1406,22 @@
             (reverse a))))))
 
 ;; lower function call containing keyword arguments
-(define (lower-kw-call f kw pa)
+(define (lower-kw-call fexpr kw pa)
   (let ((container (make-ssavalue)))
     (let loop ((kw kw)
                (initial-kw '()) ;; keyword args before any splats
                (stmts '())
                (has-kw #f))     ;; whether there are definitely >0 kwargs
       (if (null? kw)
-          (if (null? stmts)
-              `(call (call (core kwfunc) ,f) (call (top vector_any) ,@(reverse initial-kw)) ,f ,@pa)
-              `(block
-                (= ,container (call (top vector_any) ,@(reverse initial-kw)))
-                ,@(reverse stmts)
-                ,(if has-kw
+          (let ((f (make-ssavalue)))
+            `(block
+              (= ,f, fexpr)
+              ,(if (null? stmts)
+                `(call (call (core kwfunc) ,f) (call (top vector_any) ,@(reverse initial-kw)) ,f ,@pa)
+                `(block
+                  (= ,container (call (top vector_any) ,@(reverse initial-kw)))
+                  ,@(reverse stmts)
+                  ,(if has-kw
                      `(call (call (core kwfunc) ,f) ,container ,f ,@pa)
                      (let* ((expr_stmts (remove-argument-side-effects `(call ,f ,@pa)))
                             (pa         (cddr (car expr_stmts)))
@@ -1427,7 +1430,7 @@
                          ,@stmts
                          (if (call (top isempty) ,container)
                              (call ,f ,@pa)
-                             (call (call (core kwfunc) ,f) ,container ,f ,@pa)))))))
+                             (call (call (core kwfunc) ,f) ,container ,f ,@pa)))))))))
           (let ((arg (car kw)))
             (cond ((and (pair? arg) (eq? (car arg) 'parameters))
                    (error "more than one semicolon in argument list"))

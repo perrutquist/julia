@@ -270,3 +270,12 @@ function g21147(f::Tuple{A}, k = 2) where {B,A<:Tuple{B}}
 end
 @test g21147(((1,),)) === Int
 @test g21147(((1,),), 2) === Int
+
+# issue #21518
+a = 0
+f21518(;kw=nothing) = kw
+g21518() = (global a; a+=1; f21518)
+g21518()(kw=1)
+@test a == 1
+g21518()(; :kw=>1)
+@test a == 2
