@@ -616,10 +616,7 @@ STATIC_INLINE void gc_setmark(jl_ptls_t ptls, jl_taggedvalue_t *o,
     }
 }
 
-#ifndef __cplusplus
-inline
-#endif
-void gc_setmark_buf(jl_ptls_t ptls, void *o, uint8_t mark_mode, size_t minsz)
+STATIC_INLINE void gc_setmark_buf_(jl_ptls_t ptls, void *o, uint8_t mark_mode, size_t minsz)
 {
     jl_taggedvalue_t *buf = jl_astaggedvalue(o);
     uintptr_t tag = buf->header;
@@ -640,6 +637,11 @@ void gc_setmark_buf(jl_ptls_t ptls, void *o, uint8_t mark_mode, size_t minsz)
         }
         gc_setmark_big(ptls, buf, bits);
     }
+}
+
+void gc_setmark_buf(jl_ptls_t ptls, void *o, uint8_t mark_mode, size_t minsz)
+{
+    gc_setmark_buf_(ptls, o, mark_mode, minsz);
 }
 
 #define should_collect() (__unlikely(gc_num.allocd>0))
@@ -1442,14 +1444,17 @@ static void NOINLINE gc_mark_stack_resize(jl_gc_mark_cache_t *gc_cache, gc_mark_
  * The caller is also responsible for increasing `pc`.
  */
 STATIC_INLINE void gc_mark_stack_push(jl_gc_mark_cache_t *gc_cache, gc_mark_sp_t *sp,
-                                      void *pc, void *data, size_t data_size)
+                                      void *pc, void *data, size_t data_size, int inc)
 {
     assert(data_size <= sizeof(gc_mark_data_t));
     if (__unlikely(sp->pc == sp->pc_end))
         gc_mark_stack_resize(gc_cache, sp);
     *sp->pc = pc;
     memcpy(sp->data, data, data_size);
-    sp->data += data_size;
+    if (inc) {
+        sp->data += data_size;
+        sp->pc++;
+    }
 }
 
 /**
@@ -1488,8 +1493,7 @@ void gc_mark_queue_finlist(jl_gc_mark_cache_t *gc_cache, gc_mark_sp_t *sp,
         return;
     jl_value_t **items = (jl_value_t**)list->items;
     gc_mark_finlist_t markdata = {items + start, items + len};
-    gc_mark_stack_push(gc_cache, sp, gc_mark_label_addrs[2], &markdata, sizeof(markdata));
-    sp->pc++;
+    gc_mark_stack_push(gc_cache, sp, gc_mark_label_addrs[2], &markdata, sizeof(markdata), 1);
 }
 
 STATIC_INLINE void gc_mark_queue_scan_obj(jl_gc_mark_cache_t *gc_cache, gc_mark_sp_t *sp,
@@ -1501,8 +1505,7 @@ STATIC_INLINE void gc_mark_queue_scan_obj(jl_gc_mark_cache_t *gc_cache, gc_mark_
     uint8_t bits = tag & 0xf;
     tag = tag & ~(uintptr_t)0xf;
     gc_mark_marked_obj_t data = {obj, tag, bits};
-    gc_mark_stack_push(gc_cache, sp, gc_mark_label_addrs[1], &data, sizeof(data));
-    sp->pc++;
+    gc_mark_stack_push(gc_cache, sp, gc_mark_label_addrs[1], &data, sizeof(data), 1);
 }
 
 // Returns whether the object is young
@@ -1515,8 +1518,7 @@ STATIC_INLINE int gc_mark_queue_obj(jl_gc_mark_cache_t *gc_cache, gc_mark_sp_t *
     if (!gc_try_setmark(obj, &nptr, &tag, &bits))
         return (int)nptr;
     gc_mark_marked_obj_t data = {obj, tag, bits};
-    gc_mark_stack_push(gc_cache, sp, gc_mark_label_addrs[0], &data, sizeof(data));
-    sp->pc++;
+    gc_mark_stack_push(gc_cache, sp, gc_mark_label_addrs[0], &data, sizeof(data), 1);
     return (int)nptr;
 }
 
@@ -1528,15 +1530,60 @@ STATIC_INLINE void gc_mark_push_remset(jl_ptls_t ptls, jl_value_t *obj, uintptr_
 {
     if (__unlikely((nptr & 0x3) == 0x3)) {
         ptls->heap.remset_nptr += nptr >> 2;
-        arraylist_push(ptls->heap.remset, obj);
+        arraylist_t *remset = ptls->heap.remset;
+        size_t len = remset->len;
+        if (__unlikely(len >= remset->max)) {
+            arraylist_push(remset, obj);
+        }
+        else {
+            remset->len = len + 1;
+            remset->items[len] = obj;
+        }
     }
 }
 
-STATIC_INLINE int gc_mark_scan_obj8(jl_ptls_t ptls, gc_mark_sp_t *sp,
+#define pop_markdata(sp, type) ((type*)((sp)->data = (sp)->data - sizeof(type)))
+
+#define repush_markdata(sp, type) do {          \
+        (sp)->pc++;                             \
+        (sp)->data += sizeof(type);             \
+    } while (0)
+
+STATIC_INLINE int gc_mark_scan_objarray(jl_ptls_t ptls, gc_mark_sp_t *sp,
+                                        gc_mark_objarray_t *objary,
+                                        jl_value_t **begin, jl_value_t **end,
+                                        jl_value_t **pnew_obj, uintptr_t *ptag, uint8_t *pbits)
+{
+    jl_assume(objary == (gc_mark_objarray_t*)sp->data);
+    for (; begin < end; begin++) {
+        *pnew_obj = *begin;
+        if (*pnew_obj)
+            verify_parent1("obj array", *pnew_obj, begin, "elem");
+        if (!gc_try_setmark(*pnew_obj, &objary->nptr, ptag, pbits))
+            continue;
+        begin++;
+        // Found an object to mark
+        if (begin < end) {
+            // Haven't done with this one yet. Update the content and push it back
+            objary->begin = begin;
+            repush_markdata(sp, gc_mark_objarray_t);
+        }
+        else {
+            // Finished scaning this one, finish up by checking the GC invariance
+            // and let the next item replacing the current one directly.
+            gc_mark_push_remset(ptls, objary->parent, objary->nptr);
+        }
+        return 1;
+    }
+    gc_mark_push_remset(ptls, objary->parent, objary->nptr);
+    return 0;
+}
+
+STATIC_INLINE int gc_mark_scan_obj8(jl_ptls_t ptls, gc_mark_sp_t *sp, gc_mark_obj8_t *obj8,
                                     char *parent, jl_fielddesc8_t *begin, jl_fielddesc8_t *end,
                                     jl_value_t **pnew_obj, uintptr_t *ptag, uint8_t *pbits)
 {
-    gc_mark_obj8_t *obj8 = (gc_mark_obj8_t*)sp->data;
+    jl_assume(obj8 == (gc_mark_obj8_t*)sp->data);
     for (; begin < end; begin++) {
         if (!begin->isptr)
             continue;
@@ -1552,8 +1599,7 @@ STATIC_INLINE int gc_mark_scan_obj8(jl_ptls_t ptls, gc_mark_sp_t *sp,
         if (begin < end) {
             // Haven't done with this one yet. Update the content and push it back
             obj8->begin = begin;
-            sp->pc++;
-            sp->data += sizeof(gc_mark_obj8_t);
+            repush_markdata(sp, gc_mark_obj8_t);
         }
         else {
             // Finished scaning this one, finish up by checking the GC invariance
@@ -1566,11 +1612,11 @@ STATIC_INLINE int gc_mark_scan_obj8(jl_ptls_t ptls, gc_mark_sp_t *sp,
     return 0;
 }
 
-STATIC_INLINE int gc_mark_scan_obj16(jl_ptls_t ptls, gc_mark_sp_t *sp,
+STATIC_INLINE int gc_mark_scan_obj16(jl_ptls_t ptls, gc_mark_sp_t *sp, gc_mark_obj16_t *obj16,
                                      char *parent, jl_fielddesc16_t *begin, jl_fielddesc16_t *end,
                                      jl_value_t **pnew_obj, uintptr_t *ptag, uint8_t *pbits)
 {
-    gc_mark_obj16_t *obj16 = (gc_mark_obj16_t*)sp->data;
+    jl_assume(obj16 == (gc_mark_obj16_t*)sp->data);
     for (; begin < end; begin++) {
         if (!begin->isptr)
             continue;
@@ -1586,8 +1632,7 @@ STATIC_INLINE int gc_mark_scan_obj16(jl_ptls_t ptls, gc_mark_sp_t *sp,
         if (begin < end) {
             // Haven't done with this one yet. Update the content and push it back
             obj16->begin = begin;
-            sp->pc++;
-            sp->data += sizeof(gc_mark_obj16_t);
+            repush_markdata(sp, gc_mark_obj16_t);
         }
         else {
             // Finished scaning this one, finish up by checking the GC invariance
@@ -1600,11 +1645,11 @@ STATIC_INLINE int gc_mark_scan_obj16(jl_ptls_t ptls, gc_mark_sp_t *sp,
     return 0;
 }
 
-STATIC_INLINE int gc_mark_scan_obj32(jl_ptls_t ptls, gc_mark_sp_t *sp,
+STATIC_INLINE int gc_mark_scan_obj32(jl_ptls_t ptls, gc_mark_sp_t *sp, gc_mark_obj32_t *obj32,
                                      char *parent, jl_fielddesc32_t *begin, jl_fielddesc32_t *end,
                                      jl_value_t **pnew_obj, uintptr_t *ptag, uint8_t *pbits)
 {
-    gc_mark_obj32_t *obj32 = (gc_mark_obj32_t*)sp->data;
+    jl_assume(obj32 == (gc_mark_obj32_t*)sp->data);
     for (; begin < end; begin++) {
         if (!begin->isptr)
             continue;
@@ -1620,8 +1665,7 @@ STATIC_INLINE int gc_mark_scan_obj32(jl_ptls_t ptls, gc_mark_sp_t *sp,
         if (begin < end) {
             // Haven't done with this one yet. Update the content and push it back
             obj32->begin = begin;
-            sp->pc++;
-            sp->data += sizeof(gc_mark_obj32_t);
+            repush_markdata(sp, gc_mark_obj32_t);
         }
         else {
             // Finished scaning this one, finish up by checking the GC invariance
@@ -1652,6 +1696,15 @@ void *const *gc_mark_loop(jl_ptls_t ptls, gc_mark_sp_t sp)
     uint8_t bits = 0;
     int meta_updated = 0;
 
+    gc_mark_obj8_t *obj8;
+    char *obj8_parent;
+    jl_fielddesc8_t *obj8_begin;
+    jl_fielddesc8_t *obj8_end;
+
+    gc_mark_objarray_t *objary;
+    jl_value_t **objary_begin;
+    jl_value_t **objary_end;
+
 pop:
     if (sp.pc == sp.pc_start) {
         // TODO: stealing form another thread
@@ -1660,17 +1713,9 @@ pop:
     sp.pc--;
     goto *(*sp.pc);
 
-#define pop_markdata(type, name)                \
-    sp.data -= sizeof(type);                    \
-    type *name = (type*)sp.data;
-
-#define repush_markdata(type)                   \
-    sp.pc++;                                    \
-    sp.data += sizeof(type);
-
 marked_obj: {
         // An object that has been marked and needs have metadata updated and scanned.
-        pop_markdata(gc_mark_marked_obj_t, obj);
+        gc_mark_marked_obj_t *obj = pop_markdata(&sp, gc_mark_marked_obj_t);
         new_obj = obj->obj;
         tag = obj->tag;
         bits = obj->bits;
@@ -1679,7 +1724,7 @@ marked_obj: {
 
 scan_only: {
         // An object that has been marked and needs to be scanned.
-        pop_markdata(gc_mark_marked_obj_t, obj);
+        gc_mark_marked_obj_t *obj = pop_markdata(&sp, gc_mark_marked_obj_t);
         new_obj = obj->obj;
         tag = obj->tag;
         bits = obj->bits;
@@ -1687,73 +1732,56 @@ scan_only: {
         goto mark;
     }
 
-objarray: {
-        pop_markdata(gc_mark_objarray_t, objary);
-        jl_value_t **begin = objary->begin;
-        jl_value_t **end = objary->end;
-        for (; begin < end; begin++) {
-            new_obj = *begin;
-            if (new_obj)
-                verify_parent1("obj array", new_obj, begin, "elem");
-            if (!gc_try_setmark(new_obj, &objary->nptr, &tag, &bits))
-                continue;
-            begin++;
-            // Found an object to mark
-            if (begin < end) {
-                // Haven't done with this one yet. Update the content and push it back
-                objary->begin = begin;
-                repush_markdata(gc_mark_objarray_t);
-            }
-            else {
-                // Finished scaning this one, finish up by checking the GC invariance
-                // and let the next item replacing the current one directly.
-                gc_mark_push_remset(ptls, objary->parent, objary->nptr);
-            }
-            goto mark;
-        }
-        gc_mark_push_remset(ptls, objary->parent, objary->nptr);
-        goto pop;
-    }
+objarray:
+    objary = pop_markdata(&sp, gc_mark_objarray_t);
+    objary_begin = objary->begin;
+    objary_end = objary->end;
+objarray_loaded:
+    if (gc_mark_scan_objarray(ptls, &sp, objary, objary_begin, objary_end,
+                              &new_obj, &tag, &bits))
+        goto mark;
+    goto pop;
 
-obj8: {
-        pop_markdata(gc_mark_obj8_t, obj8);
-        char *parent = (char*)obj8->parent;
-        jl_fielddesc8_t *begin = obj8->begin;
-        jl_fielddesc8_t *end = obj8->end;
-        if (gc_mark_scan_obj8(ptls, &sp, parent, begin, end, &new_obj, &tag, &bits))
-            goto mark;
-        goto pop;
-    }
+obj8:
+    obj8 = pop_markdata(&sp, gc_mark_obj8_t);
+    obj8_parent = (char*)obj8->parent;
+    obj8_begin = obj8->begin;
+    obj8_end = obj8->end;
+obj8_loaded:
+    if (gc_mark_scan_obj8(ptls, &sp, obj8, obj8_parent, obj8_begin, obj8_end,
+                          &new_obj, &tag, &bits))
+        goto mark;
+    goto pop;
 
 obj16: {
-        pop_markdata(gc_mark_obj16_t, obj16);
+        gc_mark_obj16_t *obj16 = pop_markdata(&sp, gc_mark_obj16_t);
         char *parent = (char*)obj16->parent;
         jl_fielddesc16_t *begin = obj16->begin;
         jl_fielddesc16_t *end = obj16->end;
-        if (gc_mark_scan_obj16(ptls, &sp, parent, begin, end, &new_obj, &tag, &bits))
+        if (gc_mark_scan_obj16(ptls, &sp, obj16, parent, begin, end, &new_obj, &tag, &bits))
             goto mark;
         goto pop;
     }
 
 obj32: {
-        pop_markdata(gc_mark_obj32_t, obj32);
+        gc_mark_obj32_t *obj32 = pop_markdata(&sp, gc_mark_obj32_t);
         char *parent = (char*)obj32->parent;
         jl_fielddesc32_t *begin = obj32->begin;
         jl_fielddesc32_t *end = obj32->end;
-        if (gc_mark_scan_obj32(ptls, &sp, parent, begin, end, &new_obj, &tag, &bits))
+        if (gc_mark_scan_obj32(ptls, &sp, obj32, parent, begin, end, &new_obj, &tag, &bits))
             goto mark;
         goto pop;
     }
 
 stack: {
-        pop_markdata(gc_mark_stackframe_t, stack);
+        gc_mark_stackframe_t *stack = pop_markdata(&sp, gc_mark_stackframe_t);
         jl_gcframe_t *s = stack->s;
         size_t i = stack->i;
         size_t nroots = stack->nroots;
-        size_t nr = nroots >> 1;
         uintptr_t offset = stack->offset;
         uintptr_t lb = stack->lb;
         uintptr_t ub = stack->ub;
+        size_t nr = nroots >> 1;
         uintptr_t nptr = 0;
         while (1) {
             jl_value_t ***rts = (jl_value_t***)(((void**)s) + 2);
@@ -1771,13 +1799,13 @@ stack: {
                 if (i < nr) {
                     // Haven't done with this one yet. Update the content and push it back
                     stack->i = i;
-                    repush_markdata(gc_mark_stackframe_t);
+                    repush_markdata(&sp, gc_mark_stackframe_t);
                 }
                 else if ((s = (jl_gcframe_t*)gc_read_stack(&s->prev, offset, lb, ub))) {
                     stack->s = s;
                     stack->i = 0;
                     stack->nroots = gc_read_stack(&s->nroots, offset, lb, ub);
-                    repush_markdata(gc_mark_stackframe_t);
+                    repush_markdata(&sp, gc_mark_stackframe_t);
                 }
                 goto mark;
             }
@@ -1794,7 +1822,7 @@ stack: {
     }
 
 module_binding: {
-        pop_markdata(gc_mark_binding_t, binding);
+        gc_mark_binding_t *binding = pop_markdata(&sp, gc_mark_binding_t);
         jl_binding_t **begin = binding->begin;
         jl_binding_t **end = binding->end;
         uint8_t mbits = binding->bits;
@@ -1802,7 +1830,7 @@ module_binding: {
             jl_binding_t *b = *begin;
             if (b == (jl_binding_t*)HT_NOTFOUND)
                 continue;
-            gc_setmark_buf(ptls, b, mbits, sizeof(jl_binding_t));
+            gc_setmark_buf_(ptls, b, mbits, sizeof(jl_binding_t));
             void *vb = jl_astaggedvalue(b);
             verify_parent1("module", binding->parent, &vb, "binding_buff");
             (void)vb;
@@ -1815,13 +1843,12 @@ module_binding: {
                     new_obj = value;
                     begin += 2;
                     binding->begin = begin;
-                    repush_markdata(gc_mark_binding_t);
+                    repush_markdata(&sp, gc_mark_binding_t);
                     uintptr_t gr_tag;
                     uint8_t gr_bits;
                     if (gc_try_setmark(globalref, &binding->nptr, &gr_tag, &gr_bits)) {
                         gc_mark_marked_obj_t data = {globalref, gr_tag, gr_bits};
-                        gc_mark_stack_push(gc_cache, &sp, &&marked_obj, &data, sizeof(data));
-                        sp.pc++;
+                        gc_mark_stack_push(gc_cache, &sp, &&marked_obj, &data, sizeof(data), 1);
                     }
                     goto mark;
                 }
@@ -1829,7 +1856,7 @@ module_binding: {
             if (gc_try_setmark(globalref, &binding->nptr, &tag, &bits)) {
                 begin += 2;
                 binding->begin = begin;
-                repush_markdata(gc_mark_binding_t);
+                repush_markdata(&sp, gc_mark_binding_t);
                 new_obj = globalref;
                 goto mark;
             }
@@ -1842,11 +1869,15 @@ module_binding: {
             // are added only when accessed. therefore if a module is replaced
             // after "using" it but before accessing it, this array might
             // contain the only reference.
-            gc_mark_objarray_t data = {(jl_value_t*)m, (jl_value_t**)m->usings.items,
-                                       (jl_value_t**)m->usings.items + nusings, binding->nptr};
-            gc_mark_stack_push(gc_cache, &sp, &&objarray, &data, sizeof(data));
-            if (!scanparent)
-                goto objarray;
+            objary_begin = (jl_value_t**)m->usings.items;
+            objary_end = objary_begin + nusings;
+            gc_mark_objarray_t data = {(jl_value_t*)m, objary_begin, objary_end, binding->nptr};
+            gc_mark_stack_push(gc_cache, &sp, &&objarray, &data, sizeof(data), 0);
+            if (!scanparent) {
+                objary = (gc_mark_objarray_t*)sp.data;
+                goto objarray_loaded;
+            }
+            sp.data += sizeof(data);
             sp.pc++;
         }
         else {
@@ -1860,7 +1891,7 @@ module_binding: {
     }
 
 finlist: {
-        pop_markdata(gc_mark_finlist_t, finlist);
+        gc_mark_finlist_t *finlist = pop_markdata(&sp, gc_mark_finlist_t);
         jl_value_t **begin = finlist->begin;
         jl_value_t **end = finlist->end;
         for (; begin < end; begin++) {
@@ -1880,7 +1911,7 @@ finlist: {
             if (begin < end) {
                 // Haven't done with this one yet. Update the content and push it back
                 finlist->begin = begin;
-                repush_markdata(gc_mark_finlist_t);
+                repush_markdata(&sp, gc_mark_finlist_t);
             }
             goto mark;
         }
@@ -1904,9 +1935,12 @@ mark: {
             if (update_meta)
                 gc_setmark(ptls, o, bits, l * sizeof(void*) + sizeof(jl_svec_t));
             uintptr_t nptr = (l << 2) | (bits & GC_OLD);
-            gc_mark_objarray_t markdata = {new_obj, data, data + l, nptr};
-            gc_mark_stack_push(gc_cache, &sp, &&objarray, &markdata, sizeof(markdata));
-            goto objarray;
+            objary_begin = data;
+            objary_end = data + l;
+            gc_mark_objarray_t markdata = {new_obj, objary_begin, objary_end, nptr};
+            gc_mark_stack_push(gc_cache, &sp, &&objarray, &markdata, sizeof(markdata), 0);
+            objary = (gc_mark_objarray_t*)sp.data;
+            goto objarray_loaded;
         }
         else if (vt->name == jl_array_typename) {
             jl_array_t *a = (jl_array_t*)new_obj;
@@ -1921,8 +1955,8 @@ mark: {
                 void *val_buf = jl_astaggedvalue((char*)a->data - a->offset * a->elsize);
                 verify_parent1("array", new_obj, &val_buf, "buffer ('loc' addr is meaningless)");
                 (void)val_buf;
-                gc_setmark_buf(ptls, (char*)a->data - a->offset * a->elsize,
-                               bits, array_nbytes(a));
+                gc_setmark_buf_(ptls, (char*)a->data - a->offset * a->elsize,
+                                bits, array_nbytes(a));
             }
             else if (flags.how == 2) {
                 if (update_meta) {
@@ -1951,10 +1985,12 @@ mark: {
                 goto pop;
             size_t l = jl_array_len(a);
             uintptr_t nptr = (l << 2) | (bits & GC_OLD);
-            jl_value_t **data = (jl_value_t**)a->data;
-            gc_mark_objarray_t markdata = {new_obj, data, data + l, nptr};
-            gc_mark_stack_push(gc_cache, &sp, &&objarray, &markdata, sizeof(markdata));
-            goto objarray;
+            objary_begin = (jl_value_t**)a->data;
+            objary_end = objary_begin + l;
+            gc_mark_objarray_t markdata = {new_obj, objary_begin, objary_end, nptr};
+            gc_mark_stack_push(gc_cache, &sp, &&objarray, &markdata, sizeof(markdata), 0);
+            objary = (gc_mark_objarray_t*)sp.data;
+            goto objarray_loaded;
         }
         else if (vt == jl_module_type) {
             if (update_meta)
@@ -1964,7 +2000,8 @@ mark: {
             size_t bsize = m->bindings.size;
             uintptr_t nptr = ((bsize + m->usings.len + 1) << 2) | (bits & GC_OLD);
             gc_mark_binding_t markdata = {m, table + 1, table + bsize, nptr, bits};
-            gc_mark_stack_push(gc_cache, &sp, &&module_binding, &markdata, sizeof(markdata));
+            gc_mark_stack_push(gc_cache, &sp, &&module_binding, &markdata, sizeof(markdata), 0);
+            sp.data += sizeof(markdata);
             goto module_binding;
         }
         else if (vt == jl_task_type) {
@@ -1973,8 +2010,9 @@ mark: {
             assert(jl_task_type->layout->fielddesc_type == 0);
             jl_fielddesc8_t *desc = (jl_fielddesc8_t*)jl_dt_layout_fields(jl_task_type->layout);
             size_t nfields = jl_task_type->layout->nfields;
-            gc_mark_obj8_t markdata = {new_obj, desc, desc + nfields, (9 << 2) | 1 | bits};
-            gc_mark_stack_push(gc_cache, &sp, &&obj8, &markdata, sizeof(markdata));
+            jl_fielddesc8_t *desc_end = desc + nfields;
+            gc_mark_obj8_t markdata = {new_obj, desc, desc_end, (9 << 2) | 1 | bits};
+            gc_mark_stack_push(gc_cache, &sp, &&obj8, &markdata, sizeof(markdata), 0);
             jl_task_t *ta = (jl_task_t*)new_obj;
             gc_scrub_record_task(ta);
             int stkbuf = (ta->stkbuf != (void*)(intptr_t)-1 && ta->stkbuf != NULL);
@@ -1982,11 +2020,11 @@ mark: {
             jl_ptls_t ptls2 = jl_all_tls_states[tid];
             if (stkbuf) {
 #ifdef COPY_STACKS
-                gc_setmark_buf(ptls, ta->stkbuf, bits, ta->bufsz);
+                gc_setmark_buf_(ptls, ta->stkbuf, bits, ta->bufsz);
 #else
                 // stkbuf isn't owned by julia for the root task
                 if (ta != ptls2->root_task) {
-                    gc_setmark_buf(ptls, ta->stkbuf, bits, ta->ssize);
+                    gc_setmark_buf_(ptls, ta->stkbuf, bits, ta->ssize);
                 }
 #endif
             }
@@ -2007,14 +2045,20 @@ mark: {
 #endif
             }
             if (s) {
+                sp.data += sizeof(markdata);
                 sp.pc++;
                 nroots = gc_read_stack(&s->nroots, offset, lb, ub);
                 gc_mark_stackframe_t stackdata = {s, 0, nroots, offset, lb, ub};
-                gc_mark_stack_push(gc_cache, &sp, &&stack, &stackdata, sizeof(stackdata));
+                gc_mark_stack_push(gc_cache, &sp, &&stack, &stackdata, sizeof(stackdata), 0);
+                sp.data += sizeof(stackdata);
                 goto stack;
             }
             else {
-                goto obj8;
+                obj8 = (gc_mark_obj8_t*)sp.data;
+                obj8_parent = (char*)ta;
+                obj8_begin = desc;
+                obj8_end = desc_end;
+                goto obj8_loaded;
             }
         }
         else if (vt == jl_string_type) {
@@ -2040,27 +2084,27 @@ mark: {
             size_t first = offsets >> 16;
             if (layout->fielddesc_type == 0) {
                 jl_fielddesc8_t *desc = (jl_fielddesc8_t*)jl_dt_layout_fields(layout);
-                gc_mark_obj8_t markdata = {new_obj, desc + first, desc + nfields, nptr};
-                gc_mark_stack_push(gc_cache, &sp, &&obj8, &markdata, sizeof(markdata));
-                // This is very common, inline one iteration
-                sp.data -= sizeof(gc_mark_obj8_t);
-                if (__likely(gc_mark_scan_obj8(ptls, &sp, (char*)new_obj,
-                                               markdata.begin, markdata.end,
-                                               &new_obj, &tag, &bits)))
-                    goto mark;
-                goto pop;
+                obj8_parent = (char*)new_obj;
+                obj8_begin = desc + first;
+                obj8_end = desc + nfields;
+                gc_mark_obj8_t markdata = {new_obj, obj8_begin, obj8_end, nptr};
+                gc_mark_stack_push(gc_cache, &sp, &&obj8, &markdata, sizeof(markdata), 0);
+                obj8 = (gc_mark_obj8_t*)sp.data;
+                goto obj8_loaded;
             }
             else if (layout->fielddesc_type == 1) {
                 jl_fielddesc16_t *desc = (jl_fielddesc16_t*)jl_dt_layout_fields(layout);
                 gc_mark_obj16_t markdata = {new_obj, desc + first, desc + nfields, nptr};
-                gc_mark_stack_push(gc_cache, &sp, &&obj16, &markdata, sizeof(markdata));
+                gc_mark_stack_push(gc_cache, &sp, &&obj16, &markdata, sizeof(markdata), 0);
+                sp.data += sizeof(markdata);
                 goto obj16;
             }
             else {
                 assert(layout->fielddesc_type == 2);
                 jl_fielddesc32_t *desc = (jl_fielddesc32_t*)jl_dt_layout_fields(layout);
                 gc_mark_obj32_t markdata = {new_obj, desc + first, desc + nfields, nptr};
-                gc_mark_stack_push(gc_cache, &sp, &&obj32, &markdata, sizeof(markdata));
+                gc_mark_stack_push(gc_cache, &sp, &&obj32, &markdata, sizeof(markdata), 0);
+                sp.data += sizeof(markdata);
                 goto obj32;
             }
         }
